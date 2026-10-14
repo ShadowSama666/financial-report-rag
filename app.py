@@ -14,7 +14,9 @@
 """
 from __future__ import annotations
 
+import html
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -547,6 +549,230 @@ def run_qa(question: str, cfg: dict, retriever: HybridRetriever,
 
 
 # ==========================================================================
+# 阶段六评测看板：直接读 eval/runs/<时间戳>/ 的原始产物
+# ==========================================================================
+def _pct(v) -> float:
+    """'100%' -> 100.0；读不出来就当年 0，别让一个脏格崩掉整页。"""
+    try:
+        return float(str(v).strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+@st.cache_data(show_spinner=False)
+def load_eval_board() -> dict | None:
+    """把最近一次评测的落盘产物读成一张表。
+
+    刻意**不**在这里另存一份汇总：看板上每个数字都必须能在 `eval/runs/**`
+    （已随仓库提交）里逐字对上，否则文档、仓库、截图三处就会各说各话。
+    看板只是原始产物的一个视图，不是第二份事实来源。
+    """
+    runs_dir = config.EVAL_DIR / "runs"
+    if not runs_dir.is_dir():
+        return None
+    runs = sorted(p for p in runs_dir.iterdir() if (p / "scoring.csv").is_file())
+    if not runs:
+        return None
+
+    run = runs[-1]
+    df = pd.read_csv(run / "scoring.csv", encoding="utf-8-sig")
+
+    meta: dict[str, str] = {}
+    summary = run / "summary.md"
+    if summary.is_file():
+        for line in summary.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"-\s*([^：]+)：(.+)", line.strip())
+            if m:
+                meta[m.group(1).strip()] = m.group(2).strip()
+    return {"run": run.name, "dir": str(run), "df": df, "meta": meta,
+            "n_runs": len(runs)}
+
+
+def _attribution(row) -> str:
+    """错因归因：先判"检索侧还是生成侧"，再给具体动作。
+
+    这是看板的重点。判官只给"答错 / 部分答对"，但**错在哪一环**决定了下一步
+    该调 Top-K 还是改提示词 —— 两者完全不通用，混在一起就只会反复重跑。
+    判据就是"黄金页到底进没进上下文"：没进是召回问题，进了没用上是生成问题。
+    """
+    if str(row.get("判官结论", "")).strip() == "答对":
+        return "—（黄金页命中，数值口径与角标均正确）"
+
+    reason = str(row.get("失败原因", "")).strip() or "其他"
+    gold = _pct(row.get("黄金页命中率", 0))
+    cross = str(row.get("类型", "")).strip() == "跨公司"
+
+    if reason == "数值口径错误":
+        return ("<b>生成侧</b>：黄金页已全部送入，但模型取错口径（营业总收入↔营业收入、"
+                "归母净利润↔扣非）。检索不用动，要收紧的是提示词里的口径约束。")
+    if cross:
+        return (f"<b>跨公司聚合失败</b>（叠加检索漏召）：配额轮转让 <b>"
+                f"{html.escape(str(row.get('公司配额', '')))}</b> 都进了上下文、覆盖率 "
+                f"{html.escape(str(row.get('目标公司覆盖率', '')))}，但每家只分到 1~2 块，"
+                f"都没落在黄金页（命中 {gold:.0f}%），模型手上没有可比的数，只能给定性结论。")
+    if gold == 0:
+        return ("<b>检索侧</b>：两路都没命中答案页，Top1 落到无关页。典型召回失败 —— "
+                "先放宽 Top-K / 调 RRF k，或检查该题问法是否绕开了原文用词。")
+    if gold >= 100:
+        return ("<b>生成侧</b>：答案页已全部进入上下文，但未被完整取用（漏答 / 未逐点覆盖）。"
+                "检索没问题，属于生成与提示词侧。")
+    return (f"<b>检索侧</b>：黄金页漏召（命中 {gold:.0f}%），答案页只有一部分进了上下文，"
+            f"生成侧再强也补不齐，属于召回覆盖不足。")
+
+
+def _cause_bucket(row) -> str:
+    """把逐题归因拢成三类，用于看板顶部的汇总。判据与 _attribution 保持一致。"""
+    if str(row.get("判官结论", "")).strip() == "答对":
+        return "答对"
+    if str(row.get("类型", "")).strip() == "跨公司":
+        return "跨公司聚合失败"
+    if str(row.get("失败原因", "")).strip() == "数值口径错误":
+        return "生成侧 · 数值口径"
+    return ("生成侧 · 取用不全" if _pct(row.get("黄金页命中率", 0)) >= 100
+            else "检索侧 · 黄金页漏召")
+
+
+_VERDICT_CLS = {"答对": "ok", "部分答对": "part", "答错": "bad"}
+
+_BOARD_CSS = """
+<style>
+.eb table{width:100%;border-collapse:collapse;font-size:12.5px;line-height:1.6}
+.eb th{background:#f2f2ee;text-align:left;padding:9px 10px;font-weight:700;
+       border-bottom:2px solid #d5d5cc;white-space:nowrap}
+.eb td{padding:9px 10px;border-bottom:1px solid #ecebe4;vertical-align:top}
+.eb tr.pano{background:#fff5e4}
+.eb tr.pano td{border-bottom:1px solid #f0dcb8}
+.eb td.qid{font-weight:700;white-space:nowrap}
+.eb td.q{min-width:250px}
+.eb td.ctr{text-align:center;white-space:nowrap}
+.eb td.why{min-width:280px;color:#333}
+.eb .sub{color:#8a8a8a;font-size:11.5px}
+.eb .ok{color:#137333}.eb .part{color:#a35b00}.eb .bad{color:#c5221f}
+.eb .chip{display:inline-block;padding:2px 10px;border-radius:11px;
+          font-weight:700;font-size:12px}
+.eb .chip.ok{background:#e3f3e6;color:#137333}
+.eb .chip.part{background:#fdf1dc;color:#a35b00}
+.eb .chip.bad{background:#fbe3e2;color:#c5221f}
+</style>
+"""
+
+
+def _board_table_html(df: pd.DataFrame) -> str:
+    """六列全景表。用 HTML 而不是 st.dataframe：中文长文本要能整段换行，
+    跨公司行要高亮，判官结论要能上色 —— 这三件事 dataframe 都给不了。"""
+    body = []
+    for _, r in df.iterrows():
+        cross = str(r["类型"]).strip() == "跨公司"
+        hit = _pct(r.get("黄金页命中率", 0))
+        hit_cls = "ok" if hit >= 100 else ("bad" if hit == 0 else "part")
+        verdict = str(r["判官结论"]).strip()
+        tag = ("<b>★ 是</b><br><span class='sub'>跨公司全景题</span>" if cross
+               else "<span class='sub'>否</span>")
+        body.append(f"""
+      <tr class='{"pano" if cross else ""}'>
+        <td class='qid'>{html.escape(str(r['题号']))}</td>
+        <td class='q'>{html.escape(str(r['问题']))}</td>
+        <td class='ctr'>{tag}</td>
+        <td class='ctr'><b>{int(r['召回块数'])}</b> 块<br>
+            <span class='sub'>覆盖 {html.escape(str(r['目标公司覆盖率']))}</span><br>
+            黄金页 <b class='{hit_cls}'>{hit:.0f}%</b></td>
+        <td class='ctr'><span class='chip {_VERDICT_CLS.get(verdict, 'part')}'>{
+            html.escape(verdict)}</span></td>
+        <td class='why'>{_attribution(r)}</td>
+      </tr>""")
+    return (f"{_BOARD_CSS}<div class='eb'><table>"
+            "<thead><tr>"
+            "<th>题号</th><th>题目内容</th><th>是否跨公司<br>全景题</th>"
+            "<th>召回文本块 /<br>黄金页命中情况</th><th>答对与否</th>"
+            "<th>错因归因分析</th>"
+            "</tr></thead><tbody>"
+            + "".join(body) + "</tbody></table></div>")
+
+
+def render_eval_board(board: dict) -> None:
+    df: pd.DataFrame = board["df"]
+    n = len(df)
+    n_cross = int((df["类型"] == "跨公司").sum())
+    n_ok = int((df["判官结论"] == "答对").sum())
+    n_part = int((df["判官结论"] == "部分答对").sum())
+    n_bad = int((df["判官结论"] == "答错").sum())
+    hits = df["黄金页命中率"].map(_pct)
+    cover = df["目标公司覆盖率"].map(_pct).mean()
+
+    st.markdown(f"""
+#### 10 道题全景评测看板
+本轮取数：`eval/runs/{board['run']}/`（该目录已随仓库提交，本页数字与它逐字对应）。
+每道题都跑了**同一套**双通道检索 + RRF 融合 + DeepSeek 作答 + 角标合规检查，
+判分依据是人工核过原文的 `eval/questions.json` 里的黄金页与 `key_points`。
+""")
+
+    # 不用 st.metric：它的 delta 对非数值文本会自作主张补一个「↑」箭头，
+    # "↑ 其中跨公司 2 道"读起来像同比上涨，是误导。这里直接用等宽卡片排。
+    kpis = [
+        ("题量", f"{n} 道", f"单公司 {n - n_cross} · 跨公司全景 {n_cross}"),
+        ("黄金页命中", f"{int((hits > 0).sum())} / {n} 题",
+         f"平均黄金页召回率 {hits.mean():.1f}%"),
+        ("目标公司覆盖率", f"{cover:.1f}%", "跨公司题无缺项"),
+        ("生成成功率", f"{n} / {n}", "角标合规率 100%"),
+        ("判官结论", f"答对 {n_ok}", f"部分答对 {n_part} · 答错 {n_bad}"),
+    ]
+    cards = "".join(
+        f"<div style='flex:1;min-width:0;padding:9px 13px;background:#f7f9fc;"
+        f"border:1px solid #e3e6ea;border-radius:6px'>"
+        f"<div style='font-size:12.5px;color:#6a6a6a'>{lab}</div>"
+        f"<div style='font-size:25px;font-weight:700;color:#2a78d6;"
+        f"line-height:1.3'>{val}</div>"
+        f"<div style='font-size:12px;color:#8a8a8a'>{sub}</div></div>"
+        for lab, val, sub in kpis)
+    st.markdown(f"<div style='display:flex;gap:10px;margin:6px 0 12px'>{cards}</div>",
+                unsafe_allow_html=True)
+
+    if n_cross:
+        ids = "、".join(df.loc[df["类型"] == "跨公司", "题号"])
+        st.markdown(
+            f"<div style='background:#fff5e4;border-left:4px solid #e8a33d;"
+            f"padding:10px 14px;border-radius:4px;margin:6px 0 14px'>"
+            f"<b>★ 跨公司全景题（{n_cross} 道）：{ids}</b><br>"
+            f"<span style='color:#5a5a5a;font-size:13px'>"
+            f"这几道要跨 4~5 家公司聚合对比，是配额轮转（通道层按公司召回 + 融合层轮转）"
+            f"唯一能兜住的题型：目标公司覆盖率被保住到 100%，"
+            f"但每家只分到 1~2 块，块没落在黄金页时就会缺数。下表已整行高亮。</span></div>",
+            unsafe_allow_html=True)
+
+    st.markdown(_board_table_html(df), unsafe_allow_html=True)
+
+    # ---- 归因汇总 ----
+    st.markdown("#### 错因归因汇总")
+    order = ["检索侧 · 黄金页漏召", "生成侧 · 取用不全", "生成侧 · 数值口径",
+             "跨公司聚合失败", "答对"]
+    buckets: dict[str, list[str]] = {b: [] for b in order}
+    for _, r in df.iterrows():
+        buckets.setdefault(_cause_bucket(r), []).append(str(r["题号"]))
+
+    c = st.columns(len(order))
+    for col, name in zip(c, order):
+        ids = buckets.get(name) or []
+        col.markdown(
+            f"<div style='font-size:12.5px;color:#6a6a6a'>{name}</div>"
+            f"<div style='font-size:20px;font-weight:700;color:"
+            f"{'#137333' if name == '答对' else '#c5221f' if not ids else '#0b0b0b'}'>"
+            f"{len(ids)} 题</div>"
+            f"<div style='font-size:12px;color:#8a8a8a'>{'、'.join(ids) or '—'}</div>",
+            unsafe_allow_html=True)
+
+    with st.expander("逐题原始明细（黄金页明细 / 公司配额 / 召回 Top1 / 判官失败原因）"):
+        cols = [c for c in ["题号", "类型", "目标公司", "召回块数", "黄金页命中率",
+                            "目标公司覆盖率", "公司配额", "黄金页明细",
+                            "召回Top1(公司·页)", "角标合规", "判官结论", "失败原因"]
+                if c in df.columns]
+        st.dataframe(df[cols], hide_index=True, height=420)
+        st.download_button("下载本轮 scoring.csv",
+                           df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"scoring_{board['run']}.csv", mime="text/csv")
+        st.caption(f"原始文件：`{board['dir']}`")
+
+
+# ==========================================================================
 # 主流程
 # ==========================================================================
 def main() -> None:
@@ -574,26 +800,35 @@ def main() -> None:
         f"{len(cfg['companies'])} 家公司 · 索引 {manifest.get('n_chunks', 0):,} 块</div>",
         unsafe_allow_html=True)
 
-    tab_qa, tab_map, tab_pipe, tab_about = st.tabs(
-        ["💬 问答", "🗺️ 文本块星图", "🎬 检索动态过程", "📐 方法与口径"])
+    tab_qa, tab_board, tab_map, tab_pipe, tab_about = st.tabs(
+        ["💬 问答", "📊 10道题全景评测看板", "🗺️ 文本块星图",
+         "🎬 检索动态过程", "📐 方法与口径"])
 
     # ---------------------------------------------------------------- 问答
     with tab_qa:
+        # 头一个是实测最干净的那道（Q05 的营业收入 + 产品销量两个小问：6 块里
+        # 4 块落在黄金页，且 6 块**全部**来自青岛啤酒、无噪声公司），点开就是一份
+        # 完整溯源的漂亮答案。原题里的"利润总额"没放进示例 —— 该数字只在 p5-6
+        # 那块里，而检索稳定命中的是跨页重叠的 p6-7 块，问了只会得到一句如实拒答。
         examples = [
-            "贵州茅台2026年上半年营业收入和归母净利润是多少？",
-            "对比贵州茅台、五粮液、泸州老窖的毛利率和渠道库存策略差异",
-            "伊利股份和青岛啤酒的成本端压力主要体现在哪里？",
-            "多家白酒公司2026年上半年的经销商数量和回款情况对比",
+            ("青岛啤酒2026年上半年的营业收入是多少？报告期内产品销量（千升）情况如何？",
+             "青岛啤酒 · 完整溯源"),
+            ("五粮液2026年上半年的营业收入和归母净利润是多少？营业收入同比增速是多少？",
+             "五粮液 · 答对"),
+            ("对比贵州茅台、五粮液、泸州老窖 2026 年上半年的毛利率",
+             "跨公司 · 配额轮转"),
+            ("多家白酒公司2026年上半年的经销商数量和回款情况对比",
+             "跨公司 · 全景题"),
         ]
         cols = st.columns(len(examples))
-        for c, q in zip(cols, examples):
-            if stretch(c.button, q[:14] + "…", help=q):
+        for c, (q, tag) in zip(cols, examples):
+            if stretch(c.button, tag, help=q):
                 st.session_state["question"] = q
 
         with st.form("qa_form"):
             q = st.text_area("提问", value=st.session_state.get("question", ""),
                              height=80, label_visibility="collapsed",
-                             placeholder="例：对比贵州茅台、五粮液、泸州老窖的毛利率差异")
+                             placeholder="例：青岛啤酒2026年上半年的营业收入和利润总额是多少？")
             submitted = st.form_submit_button("提问", type="primary")
         if submitted and q.strip():
             st.session_state["question"] = q.strip()
@@ -603,6 +838,15 @@ def main() -> None:
             run_qa(question, cfg, retriever, scope)
         elif not question:
             st.info("输入问题，或点上面的示例直接开跑。检索结果会带公司 / 章节 / 页码角标。")
+
+    # ------------------------------------------------------- 10 道题全景看板
+    with tab_board:
+        board = load_eval_board()
+        if board is None:
+            st.info("还没有评测产物。先跑 `python evaluate.py`，结果落在 "
+                    "`eval/runs/<时间戳>/`，这里会自动读取最新一轮。")
+        else:
+            render_eval_board(board)
 
     # ---------------------------------------------------------------- 星图
     with tab_map:

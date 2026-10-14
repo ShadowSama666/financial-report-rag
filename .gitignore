@@ -33,8 +33,11 @@ models/
 *.sqlite
 *.db
 
-# ---- 5. 评测临时输出 ----
-eval/runs/
+# ---- 5. 评测输出 ----
+# 注意：eval/runs/** 是**入库的交付物**，不是缓存 —— 10 道题的原始评测日志
+# （results.jsonl / scoring.csv / recall_detail.csv / summary.md）必须随仓库
+# 一起提交，作业的评测结论才可复现、可审计。因此这里**不**排除 eval/runs/。
+# 只排除真正的临时物：跑评测时的控制台日志。
 eval/*.log
 
 # ---- 6. Python ----
