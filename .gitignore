@@ -1,0 +1,60 @@
+# ==========================================================================
+# 阶段一：环境与安全初始化
+# 目标：API Key、PDF 缓存、本地索引 三类文件永远不进 Git
+# ==========================================================================
+
+# ---- 1. 敏感信息（绝对禁止提交）----
+.env
+.env.*
+!.env.example
+*.key
+*pem
+secrets.toml
+.streamlit/secrets.toml
+
+# ---- 2. PDF 原文缓存（体积大 + 版权归属交易所/上市公司，不入库）----
+data/pdfs/
+!data/pdfs/.gitkeep
+
+# ---- 3. 解析中间产物（可由 PDF 再生）----
+data/pages/
+
+# ---- 4. 本地索引文件（向量库 / 倒排索引 / 编码缓存）----
+index/
+data/chunks/
+models/
+*.faiss
+*.index
+*.npy
+*.npz
+*.pkl
+*.joblib
+*.bin
+*.sqlite
+*.db
+
+# ---- 5. 评测临时输出 ----
+eval/runs/
+eval/*.log
+
+# ---- 6. Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- 7. 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 例外：评测记录模板必须入库（是交付物，不是缓存）
+!eval/questions.json
+!eval/scoring_template.csv
+
+# 构建/下载日志（含本机绝对路径，不入库）
+*.log

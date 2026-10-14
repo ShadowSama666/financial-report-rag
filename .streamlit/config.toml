@@ -1,0 +1,16 @@
+# Streamlit 外壳配色：与 utils/palette.py 的浅色 token 对齐，
+# 让页面底色（page）与图表表面色（surface）连成一片，图表不"贴"在异色方块上。
+# 图表自身的浅色/深色由侧边栏切换（深色是独立校验过的一套档位，不是自动反转）。
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f9f9f7"
+textColor = "#0b0b0b"
+
+[server]
+headless = true
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false

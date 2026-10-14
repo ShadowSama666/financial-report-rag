@@ -1,0 +1,44 @@
+# ==========================================================================
+# 申万食品饮料 半年报问答知识库 —— 依赖清单
+# 安装：pip install -r requirements.txt
+# 注：torch 体积大且分 CPU/CUDA 版本，建议单独装，见文末说明
+# ==========================================================================
+
+# ---- 阶段二：数据下载 ----
+requests>=2.32.0
+python-dotenv>=1.0.1
+
+# ---- 阶段三：PDF 解析与切块 ----
+pypdf>=4.3.0              # 快速抽取纯文本（表格能力弱，作为 --engine pypdf 备选）
+pdfplumber>=0.11.4        # 主力解析器：逐页文本 + 表格结构还原
+jieba>=0.42.1             # 中文分词，供 BM25 倒排索引使用
+
+# ---- 阶段四：双通道混合索引 ----
+sentence-transformers>=3.1.0   # 加载 Qwen3-Embedding-0.6B
+rank_bm25>=0.2.2
+numpy>=1.26.0
+scikit-learn>=1.5.0
+
+# ---- 阶段五：可视化前端 ----
+streamlit>=1.39.0
+plotly>=5.24.0            # 散点图支持 click 事件（st.plotly_chart on_select）
+
+# ---- 阶段六：评测 ----
+pandas>=2.2.0
+
+# ---- 工程工具 ----
+tqdm>=4.66.0
+
+# ==========================================================================
+# torch 安装说明
+#   sentence-transformers 会自动拉 torch，无需在这份清单里固定版本。
+#   Windows 下 PyPI 的 torch wheel 本身已是 CPU 体积（torch 2.14 约 124MB），
+#   直接 pip install 即可；若要走官方 CPU 专用索引：
+#       pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   要用 GPU 加速（本项目的 0.6B 模型在 CPU 上已足够）：
+#       按 https://pytorch.org 官网命令安装对应 CUDA 版本
+#
+# Python 版本提醒：本机为 3.14，torch 需要 2.14+、pandas 需要 3.x 才有 cp314 wheel。
+# 若 pip 开始"从源码构建"某个包（出现 pip-build-env / Building wheel），
+# 基本是该包还没有对应的 cp314 wheel，换 3.12/3.13 虚拟环境最省事。
+# ==========================================================================
