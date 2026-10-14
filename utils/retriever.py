@@ -293,20 +293,39 @@ class HybridRetriever:
                 logger.warning("公司过滤 %s 未命中任何文本块，回退到全库检索", companies)
                 allowed = None
 
+        # `companies` 这一个参数扛了两个角色，必须拆开：
+        #   ① 检索白名单 —— 侧边栏「公司范围」，界面上默认 10 家全选；
+        #   ② "这道题在问哪几家" —— 决定配额轮转该对着谁轮。
+        # 之前把 ② 直接当成 ①，于是问「茅台、五粮液、老窖」时是**对着 10 家轮转**：
+        # 最终只送 6 块，10 家人均 0.6 块，实测茅台/老窖/汾酒/今世缘一块都没进 ——
+        # 模型只能回"检索结果中未出现贵州茅台任何数据"。看着像检索坏了，
+        # 其实是配额把名额发给了根本没被问到的公司。
+        asked = [c for c in (companies or []) if c in query]
+        targets = asked or list(companies or [])
+        multi_company = len(set(targets)) > 1
+
         qv = self.encode_query(query)
         tokens = tokenize(query)
 
         # 多公司问题：两个通道都改成"按公司各取 Top-N 再并集"，
         # 否则全局 top-k 截断会把排名靠后的公司整个挤出候选池，
         # 融合层的配额轮转就无从下手（它只能重排已有候选，造不出新候选）。
-        per_company = bool(companies and len(set(companies)) > 1
+        per_company = bool(multi_company
                            and config.BALANCE_MULTI_COMPANY
                            and config.PER_COMPANY_CHANNEL_K > 0
                            and allowed is not None)
+        buckets: dict[str, list[int]] = {}
         if per_company:
-            buckets: dict[str, list[int]] = {}
+            # 只给**被问到的那几家**分桶取材。白名单里没被问到的公司仍然可以
+            # 通过下面的普通检索进来，只是不占配额。
+            wanted = set(targets)
             for i in allowed:
-                buckets.setdefault(by_id[self.chunk_ids[i]]["company"], []).append(i)
+                c = by_id[self.chunk_ids[i]]["company"]
+                if c in wanted:
+                    buckets.setdefault(c, []).append(i)
+            per_company = len(buckets) > 1        # 被问的公司没有块，退回普通检索
+
+        if per_company:
             k = config.PER_COMPANY_CHANNEL_K
             vhits = merge_channel_hits(
                 [self.vector_search(query, k, rows, qvec=qv) for rows in buckets.values()])
@@ -365,8 +384,8 @@ class HybridRetriever:
 
         # 融合层轮转由 BALANCE_MULTI_COMPANY 单独控制，与上面候选池那层互不依赖：
         # PER_COMPANY_CHANNEL_K=0 关掉的是"每家公司都进池"，不是"最终每家公司都有配额"。
-        multi = bool(companies and len(set(companies)) > 1
-                     and config.BALANCE_MULTI_COMPANY)
+        # 轮转的判定同样按"被问到的公司"（targets），不按检索范围 —— 理由见上面 asked 那段。
+        multi = bool(multi_company and config.BALANCE_MULTI_COMPANY)
         if multi:
             ordered = balance_by_company(ordered, top_k_final, config.PER_COMPANY_K)
         else:
